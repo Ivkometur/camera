@@ -70,18 +70,36 @@ def db_connect():
     )
 
 
-def active_people_count(conn) -> int:
+def office_workers_count(conn) -> int:
     active_status = env_str("ACTIVE_WORK_STATUS", "work")
-    sql = """
-    SELECT COUNT(DISTINCT w.usid)
-    FROM work w
-    WHERE w.work_status = %s
-    """
+    office_task_id = env_int("OFFICE_TASK_ID", 0)
+    office_task_name = env_str("OFFICE_WORK_NAME", "Работа в офисе")
+
+    if office_task_id > 0:
+        sql = """
+        SELECT COUNT(DISTINCT w.usid)
+        FROM work w
+        WHERE w.work_status = %s
+          AND w.task_id = %s
+        """
+        params = (active_status, office_task_id)
+    else:
+        sql = """
+        SELECT COUNT(DISTINCT w.usid)
+        FROM work w
+        LEFT JOIN tasks t ON t.task_id = w.task_id
+        WHERE w.work_status = %s
+          AND t.task_name = %s
+        """
+        params = (active_status, office_task_name)
+
     with conn.cursor() as cur:
-        cur.execute(sql, (active_status,))
+        cur.execute(sql, params)
         row = cur.fetchone()
+
     if not row:
         return 0
+
     value = row[0] if isinstance(row, (tuple, list)) else next(iter(row.values()))
     return int(value or 0)
 
@@ -99,10 +117,10 @@ def office_camera_people_count(counter: PeopleCounterYOLO, rtsp_url: str) -> int
     raise RuntimeError("Could not read office camera snapshot")
 
 
-def build_report(active_people: int, office_camera_people: int) -> str:
+def build_report(office_workers: int, office_camera_people: int) -> str:
     return (
-        f"по активным задачам: {active_people} человека\n"
-        f"по камере в офисе: {office_camera_people} человека"
+        f"работают в офисе (по БД): {office_workers} чел.\n"
+        f"по камере в офисе: {office_camera_people} чел."
     )
 
 
@@ -128,13 +146,13 @@ def main() -> None:
     while True:
         try:
             try:
-                active_people = active_people_count(conn)
+                office_workers = office_workers_count(conn)
             except Exception:
                 conn = db_connect()
-                active_people = active_people_count(conn)
+                office_workers = office_workers_count(conn)
 
             office_people = office_camera_people_count(counter, rtsp_url)
-            message = build_report(active_people, office_people)
+            message = build_report(office_workers, office_people)
 
             print(f"[{datetime.now().isoformat(timespec='seconds')}] {message.replace(chr(10), ' | ')}", flush=True)
             tg_send_message(admin_chat_id, message)
