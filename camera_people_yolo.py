@@ -190,7 +190,7 @@ class PeopleCounterYOLO:
     def _make_tiles(self, W: int, H: int) -> List[Tuple[int, int, int, int]]:
         cols = max(1, int(self.tile_cols))
         rows = max(1, int(self.tile_rows))
-        ov = float(self.tile_overlap)
+        ov = min(0.8, max(0.0, float(self.tile_overlap)))
 
         tile_w = int(np.ceil(W / cols))
         tile_h = int(np.ceil(H / rows))
@@ -212,6 +212,9 @@ class PeopleCounterYOLO:
             if y2 >= H:
                 break
             y += step_h
+        max_tiles = _env_int("TILE_MAX_TILES", 64)
+        if len(tiles) > max_tiles:
+            return tiles[:max_tiles]
         return tiles
 
     def infer(self, frame_bgr: np.ndarray) -> Dict[str, Any]:
@@ -273,7 +276,7 @@ class PeopleCounterYOLO:
             score_threshold=float(self.conf),
             nms_threshold=float(self.iou),
         )
-        if len(idxs) == 0:
+        if idxs is None or len(idxs) == 0:
             stats["t_ms"] = int((time.time() - t0) * 1000)
             return {"count": 0, "detections": [], "stats": stats, "masked": masked}
 

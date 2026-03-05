@@ -11,15 +11,6 @@ from camera_people_yolo import PeopleCounterYOLO
 from rtsp_snapshot import rtsp_snapshot_bgr
 from tg_notify import tg_send_message, tg_send_photo
 
-# --- /o1 status mode flag (controlled by tg_control_bot.py) ---
-def _office_status_enabled() -> bool:
-    try:
-        state_dir = (os.getenv("STATE_DIR") or "/opt/factory-bot/state").strip() or "/opt/factory-bot/state"
-        return os.path.exists(os.path.join(state_dir, "office_status_on"))
-    except Exception:
-        return False
-
-
 # --- Optional ULTRA detector (won't crash if module missing) ---
 try:
     from camera_people_ultra import PeopleCounterUltra  # type: ignore
@@ -257,9 +248,30 @@ def people_count_window(
     last_res: Any = None
     last_frame: Any = None
 
+    snap_retries = _env_int("SNAPSHOT_RETRIES", 2)
+
     for i in range(n):
-        frame = rtsp_snapshot_bgr(rtsp_url)
-        res = counter.infer(frame)
+        frame = None
+        last_error = None
+        for _ in range(max(1, snap_retries)):
+            try:
+                frame = rtsp_snapshot_bgr(rtsp_url)
+                break
+            except Exception as e:
+                last_error = e
+                time.sleep(0.15)
+
+        if frame is None:
+            if log_each:
+                print(f"[WARN] snapshot failed on {i+1}/{n}: {last_error}", flush=True)
+            continue
+
+        try:
+            res = counter.infer(frame)
+        except Exception as e:
+            if log_each:
+                print(f"[WARN] infer failed on {i+1}/{n}: {e}", flush=True)
+            continue
 
         cnt = int(res.get("count", 0))
         counts.append(cnt)
@@ -278,7 +290,10 @@ def people_count_window(
 
         time.sleep(max(0.0, sleep_s))
 
-    med = int(statistics.median(counts)) if counts else 0
+    if not counts:
+        raise RuntimeError("all snapshots failed in window")
+
+    med = int(statistics.median(counts))
     return med, counts, last_stats, last_res, last_frame
 
 
@@ -328,6 +343,7 @@ def main():
         counter = PeopleCounterYOLO(model_path)
 
     conn = db_connect()
+    apply_bias = _env_bool("APPLY_OFFICE_BIAS", False)
 
     # --- state ---
     prev_detected: Optional[int] = None
@@ -349,7 +365,11 @@ def main():
 
     while True:
         try:
-            expected, expected_names, _rows = get_expected_office(conn)
+            try:
+                expected, expected_names, _rows = get_expected_office(conn)
+            except Exception:
+                conn = db_connect()
+                expected, expected_names, _rows = get_expected_office(conn)
 
             detected, counts, stats, last_res, last_frame = people_count_window(
                 counter,
@@ -359,6 +379,14 @@ def main():
                 log_each=log_each_snapshot,
             )
 
+            detected_raw = detected
+            if apply_bias:
+                detected = _apply_bias(detected)
+                stats["bias_applied"] = True
+                stats["detected_raw"] = detected_raw
+                stats["detected_adjusted"] = detected
+            else:
+                stats["bias_applied"] = False
             stats["counts_window"] = counts
             stats["median"] = detected
 
@@ -376,6 +404,8 @@ def main():
             except Exception as _e:
                 print(f"[WARN] /o1 status send failed: {_e}", flush=True)
 ### [O1_STATUS_SEND] ###
+
+            _write_last_tick(int(time.time()), detected, expected, engine)
 
             raw_pair = (expected, detected)
 
