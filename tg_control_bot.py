@@ -191,36 +191,12 @@ def _latest_tick() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     return best, best_path
 
 def _try_apply_calibration(real_count: int) -> Optional[str]:
-    now = int(time.time())
-    tick, tick_path = _latest_tick()
-    if not tick:
-        searched = ", ".join(_candidate_last_tick_files())
-        return (
-            "Нет последнего замера (office_last_tick.json отсутствует). "
-            f"Проверь, что monitor_office.py и tg_control_bot.py используют один STATE_DIR. Поиск: {searched}"
-        )
-    try:
-        ts = int(tick.get("ts", 0))
-        detected = int(tick.get("detected", 0))
-        expected = int(tick.get("expected", 0))
-        engine = str(tick.get("engine", ""))
-        if now - ts > TTL_SEC:
-            return f"Слишком поздно: последний замер был {now-ts}с назад (TTL={TTL_SEC}с). Дождись нового сообщения и отправь число сразу."
-    except Exception:
-        return "Ошибка чтения последнего замера (office_last_tick.json повреждён)."
+    return (
+        "ℹ️ Калибровка отключена в новой версии. "
+        f"Получено число: {int(real_count)}. "
+        "Теперь monitor_office.py отправляет фиксированный отчёт каждые 30 секунд."
+    )
 
-    bias = int(real_count) - int(detected)
-    if abs(bias) > BIAS_MAX_ABS:
-        _append_line(CALIB_LOG, {"ts": now, "real": real_count, "detected": detected, "expected": expected, "bias": bias, "accepted": False, "reason": "bias_too_large"})
-        return f"Калибровку НЕ принял: разница {bias} слишком большая (лимит +/-{BIAS_MAX_ABS})."
-
-    bias_path = BIAS_FILE
-    if tick_path:
-        bias_path = os.path.join(os.path.dirname(tick_path), "office_bias.json")
-    mean2, n2 = _update_bias(bias, bias_path)
-    _append_line(CALIB_LOG, {"ts": now, "real": real_count, "detected": detected, "expected": expected, "bias": bias, "accepted": True, "mean": mean2, "n": n2, "engine": engine})
-    src = tick_path or LAST_TICK_FILE
-    return f"✅ Калибровка принята: детектор={detected}, реально={real_count}, bias={bias}. Текущий mean_bias={mean2:.2f} (n={n2}). Источник: {src}"
 
 def main() -> None:
     if not BOT_TOKEN:
@@ -232,7 +208,7 @@ def main() -> None:
     _acquire_single_instance_lock()
     offset = _load_offset()
 
-    _tg_send(ADMIN_CHAT_ID, "🤖 TG control bot started.\nКоманды: /o1 (вкл статус), /o0 (выкл статус), /obias (показать bias)\nКалибровка: после сообщения 'В офисе - X людей' просто пришли правильное число (например 4).")
+    _tg_send(ADMIN_CHAT_ID, "🤖 TG control bot started.\nКоманды: /o1, /o0, /obias\nЧисла больше не калибруют модель: бот только подтверждает получение.")
 
     while True:
         try:
@@ -268,7 +244,7 @@ def main() -> None:
 
                     if text.startswith("/o1"):
                         _set_flag(True)
-                        _tg_send(ADMIN_CHAT_ID, "✅ /o1 включён: будет слать 'В офисе - X людей' каждый тик (раз в MONITOR_INTERVAL_S). Если неверно — просто отправь правильное число.")
+                        _tg_send(ADMIN_CHAT_ID, "✅ /o1 включён.")
                         continue
 
                     if text.startswith("/o0"):
