@@ -50,6 +50,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 STATE_DIR = _env_str("STATE_DIR", "/opt/factory-bot/state").strip() or "/opt/factory-bot/state"
 OFFICE_STATUS_FLAG = os.path.join(STATE_DIR, "office_status_on")
 OFFICE_LAST_TICK_FILE = os.path.join(STATE_DIR, "office_last_tick.json")
+OFFICE_LAST_TICK_PREV_FILE = os.path.join(STATE_DIR, "office_last_tick.prev.json")
 OFFICE_BIAS_FILE = os.path.join(STATE_DIR, "office_bias.json")
 
 BIAS_ALPHA = _env_float("BIAS_ALPHA", 0.30)
@@ -78,12 +79,26 @@ def _apply_bias(detected: int) -> int:
 def _write_last_tick(ts: int, detected: int, expected: int, engine: str) -> None:
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
+        if os.path.exists(OFFICE_LAST_TICK_FILE):
+            try:
+                os.replace(OFFICE_LAST_TICK_FILE, OFFICE_LAST_TICK_PREV_FILE)
+            except Exception:
+                pass
         tmp = OFFICE_LAST_TICK_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"ts": int(ts), "detected": int(detected), "expected": int(expected), "engine": str(engine)}, f, ensure_ascii=False)
         os.replace(tmp, OFFICE_LAST_TICK_FILE)
     except Exception:
         pass
+
+
+def _people_word(n: int) -> str:
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return "человек"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "человека"
+    return "человек"
 
 def db_connect():
     host = _env_str("DB_HOST")
@@ -343,7 +358,7 @@ def main():
         counter = PeopleCounterYOLO(model_path)
 
     conn = db_connect()
-    apply_bias = _env_bool("APPLY_OFFICE_BIAS", False)
+    apply_bias = _env_bool("APPLY_OFFICE_BIAS", True)
 
     # --- state ---
     prev_detected: Optional[int] = None
@@ -403,7 +418,7 @@ def main():
             # /o1 enabled -> send short status each tick
             try:
                 if _office_status_enabled():
-                    tg_send_message(admin_chat_id, f"В офисе - {detected} людей")
+                    tg_send_message(admin_chat_id, f"В офисе - {detected} {_people_word(detected)}")
             except Exception as _e:
                 print(f"[WARN] /o1 status send failed: {_e}", flush=True)
 ### [O1_STATUS_SEND] ###
