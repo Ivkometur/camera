@@ -1,0 +1,290 @@
+import os
+import time
+import json
+import statistics
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Tuple
+
+import pymysql
+
+from camera_people_yolo import PeopleCounterYOLO
+# PeopleCounterUltra должен быть в проекте (у тебя ULTRA уже работал по логам)
+from rtsp_snapshot import rtsp_snapshot_bgr
+from tg_notify import tg_send_message, tg_send_photo
+
+
+
+# --- Optional ULTRA detector (won't crash if module missing) ---
+try:
+    from camera_people_ultra import PeopleCounterUltra  # type: ignore
+except Exception:
+    PeopleCounterUltra = None  # type: ignore
+
+def _env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else str(v)
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def db_connect():
+    host = _env_str("DB_HOST")
+    user = _env_str("DB_USER")
+    password = _env_str("DB_PASSWORD")
+    dbname = _env_str("DB_NAME")
+    port = _env_int("DB_PORT", 3306)
+
+    if not host or not user or not dbname:
+        raise SystemExit("DB_HOST/DB_USER/DB_NAME not set in .env")
+
+    return pymysql.connect(
+        host=host,
+        user=user,
+        password=password,
+        database=dbname,
+        port=port,
+        autocommit=True,
+    )
+
+
+def load_cameras() -> List[Dict[str, Any]]:
+    cams_json = _env_str("CAMERAS_JSON", "[]").strip()
+    try:
+        cams = json.loads(cams_json)
+        if not isinstance(cams, list):
+            return []
+        return cams
+    except Exception:
+        return []
+
+
+def pick_office_camera(cams: List[Dict[str, Any]]) -> Dict[str, Any]:
+    want_id = _env_str("OFFICE_CAMERA_ID", "office").strip().lower()
+
+    for c in cams:
+        if str(c.get("id", "")).strip().lower() == want_id:
+            return c
+
+    for c in cams:
+        if str(c.get("id", "")).strip().lower() == "office":
+            return c
+
+    if cams:
+        return cams[0]
+
+    raise SystemExit("No cameras in CAMERAS_JSON")
+
+
+def get_expected_office(conn) -> tuple[int, list[str], list[tuple]]:
+    """
+    Returns:
+      expected: int
+      names: list[str]
+      raw_rows: list[tuple]  (work_id, fio, uname, task_name, accept_dt)
+
+    Office workers = rows where work.work_status='work' AND tasks.task_name == OFFICE_WORK_NAME
+    """
+    office_name = _env_str("OFFICE_WORK_NAME", "Работа в офисе").strip()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+              w.work_id,
+              u.fio,
+              u.uname,
+              t.task_name,
+              w.accept_dt
+            FROM work w
+            LEFT JOIN users u ON u.usid = w.usid
+            LEFT JOIN tasks t ON t.task_id = w.task_id
+            WHERE w.work_status=%s
+              AND t.task_name=%s
+            ORDER BY w.accept_dt DESC
+            """,
+            ("work", office_name),
+        )
+        rows = cur.fetchall() or []
+
+    def _name(fio, uname, work_id):
+        fio = (fio or "").strip()
+        uname = (uname or "").strip()
+        return fio or uname or f"work_id={work_id}"
+
+    names = [_name(r[1], r[2], r[0]) for r in rows]
+    expected = len(rows)
+    return expected, names, list(rows)
+
+
+def people_count_window(counter, rtsp_url: str, n: int = 5, sleep_s: float = 0.12) -> Tuple[int, List[int], Dict[str, Any], Optional[str]]:
+    """
+    Take n snapshots quickly, run detector, return (median, counts, last_stats, last_debug_boxes_path)
+    """
+    counts: List[int] = []
+    last_stats: Dict[str, Any] = {}
+    last_debug_boxes: Optional[str] = None
+
+    for i in range(n):
+        frame = rtsp_snapshot_bgr(rtsp_url)
+        res = counter.infer(frame)
+
+        cnt = int(res.get("count", 0))
+        counts.append(cnt)
+
+        last_stats = res.get("stats") or {}
+        last_stats["frame_wh"] = last_stats.get("frame_wh") or (frame.shape[1], frame.shape[0])
+
+        if i == n - 1 and _env_bool("DEBUG_SAVE_PHOTOS", False):
+            ts = int(time.time())
+            out_prefix = f"/opt/factory-bot/photos/monitor_{ts}"
+            dets = res.get("detections") or []
+            masked = res.get("masked", None)
+            paths = counter.draw_debug(frame, masked, dets, out_prefix)
+            last_debug_boxes = paths.get("boxes")
+
+        time.sleep(max(0.0, sleep_s))
+
+    med = int(statistics.median(counts)) if counts else 0
+    return med, counts, last_stats, last_debug_boxes
+
+
+def fmt_stats(stats: Dict[str, Any]) -> str:
+    w, h = stats.get("frame_wh", ("?", "?"))
+    return (
+        f"frame={w}x{h} imgsz={stats.get('imgsz')} conf={stats.get('conf')} iou={stats.get('iou')} "
+        f"t_ms={stats.get('t_ms')}"
+    )
+
+
+def main():
+    model_path = _env_str("YOLO_MODEL_PATH", "models/yolov8n.onnx")
+    engine = _env_str("DETECTOR_ENGINE", "opencv").strip().lower()
+
+    admin_chat_id = _env_str("ADMIN_CHAT_ID", _env_str("ADMIN_TELEGRAM_ID", "")).strip()
+    if not admin_chat_id:
+        raise SystemExit("ADMIN_CHAT_ID / ADMIN_TELEGRAM_ID not set")
+
+    cams = load_cameras()
+    cam = pick_office_camera(cams)
+    rtsp_url = str(cam.get("rtsp_url", "")).strip()
+    room = str(cam.get("room", "Office")).strip()
+    if not rtsp_url:
+        raise SystemExit("office camera rtsp_url is empty")
+
+    interval_s = _env_int("MONITOR_INTERVAL_S", _env_int("MONITOR_INTERVAL_SEC", 10))
+    window_checks = _env_int("MONITOR_WINDOW_CHECKS", _env_int("MONITOR_WINDOW_COUNT", 6))
+
+    # Controls:
+    report_drop = _env_bool("REPORT_DROP_IMMEDIATELY", True)  # notify if detected decreases
+    drop_min_delta = _env_int("DROP_MIN_DELTA", 1)
+
+    # Notify when detected < expected (office mismatch)
+    notify_mismatch = _env_bool("REPORT_MISMATCH", True)
+    # Detector
+    # DETECTOR_ENGINE=ultra uses Ultralytics pipeline (if available), else fallback to YOLO(OpenCV-DNN)
+    if engine == "ultra" and PeopleCounterUltra is not None:
+        counter = PeopleCounterUltra()
+    else:
+        if engine == "ultra" and PeopleCounterUltra is None:
+            print("[WARN] DETECTOR_ENGINE=ultra but camera_people_ultra.py is missing -> fallback to PeopleCounterYOLO", flush=True)
+        counter = PeopleCounterYOLO(model_path)
+    # Detector
+    # DETECTOR_ENGINE=ultra -> Ultralytics YOLO (if available), else fallback to OpenCV-DNN YOLO
+    if engine == "ultra" and PeopleCounterUltra is not None:
+        counter = PeopleCounterUltra()
+    else:
+        if engine == "ultra" and PeopleCounterUltra is None:
+            print("[WARN] DETECTOR_ENGINE=ultra but PeopleCounterUltra is missing -> fallback to PeopleCounterYOLO", flush=True)
+        counter = PeopleCounterYOLO(model_path)
+
+    conn = db_connect()
+
+    prev_detected: Optional[int] = None
+    last_reported_diff: Optional[int] = None  # for mismatch notifications (only when diff worsens)
+
+    tg_send_message(
+        admin_chat_id,
+        f"✅ factory-monitor started. room={room}. interval={interval_s}s window={window_checks}. engine={engine}",
+    )
+
+    while True:
+        try:
+            expected, expected_names, expected_rows = get_expected_office(conn)
+            detected, counts, stats, debug_boxes_path = people_count_window(counter, rtsp_url, n=5, sleep_s=0.12)
+
+            stats["counts_window"] = counts
+            stats["median"] = detected
+
+            print(
+                f"[{datetime.now().isoformat(timespec='seconds')}] expected={expected} detected={detected} "
+                f"win={counts} median={detected} {fmt_stats(stats)}",
+                flush=True,
+            )
+
+
+            # --- Notify: mismatch + drop (with names + photo) ---
+            try:
+                # 1) notify if detected decreases vs previous tick
+                if report_drop and prev_detected is not None and detected <= (prev_detected - drop_min_delta):
+                    msg = (
+                        f"📉 Уменьшилось количество людей на камере\n"
+                        f"Комната: {room}\n"
+                        f"Было: {prev_detected}\n"
+                        f"Стало (median/5): {detected}\n"
+                        f"Ожидается (Работа в офисе): {expected}\n"
+                    )
+                    if expected_names:
+                        msg += "Имена (по БД): " + ", ".join(expected_names) + "\n"
+                    msg += "Stats: " + fmt_stats(stats)
+                    tg_send_message(admin_chat_id, msg)
+                    if debug_boxes_path:
+                        tg_send_photo(admin_chat_id, debug_boxes_path, caption="Drop snapshot (boxes)")
+            
+                # 2) notify mismatch (expected > detected) only when diff worsens
+                if notify_mismatch:
+                    diff = expected - detected
+                    if diff > 0:
+                        if last_reported_diff is None or diff > last_reported_diff:
+                            last_reported_diff = diff
+                            names_txt = ", ".join(expected_names) if expected_names else "-"
+                            msg = (
+                                f"🚨 Несоответствие: людей меньше нормы\n"
+                                f"Комната: {room}\n"
+                                f"Ожидается (Работа в офисе): {expected}\n"
+                                f"Имена: {names_txt}\n"
+                                f"На камере (median/5): {detected}\n"
+                                f"Diff: {diff}\n"
+                                f"Stats: {fmt_stats(stats)}"
+                            )
+                            tg_send_message(admin_chat_id, msg)
+                            if debug_boxes_path:
+                                tg_send_photo(admin_chat_id, debug_boxes_path, caption="Mismatch snapshot (boxes)")
+                    else:
+                        # если всё ок — сбрасываем, чтобы при новом ухудшении снова пришло
+                        last_reported_diff = None
+            except Exception as _e:
+                print(f"[WARN] notify failed: {_e}", flush=True)
+            
+            prev_detected = detected
+            time.sleep(max(1, interval_s))
+
+        except Exception as e:
+            print(f"[{datetime.now().isoformat(timespec='seconds')}] ERROR: {e}", flush=True)
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()

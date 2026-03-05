@@ -1,0 +1,218 @@
+import os
+import time
+import json
+import statistics
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Tuple
+
+import pymysql
+
+from camera_people_yolo import PeopleCounterYOLO
+from rtsp_snapshot import rtsp_snapshot_bgr  # <-- ожидается функция, которая возвращает frame BGR (numpy)
+from tg_notify import tg_send_message, tg_send_photo
+
+
+def _env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else str(v)
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def db_connect():
+    host = _env_str("DB_HOST")
+    user = _env_str("DB_USER")
+    password = _env_str("DB_PASSWORD")
+    dbname = _env_str("DB_NAME")
+    port = _env_int("DB_PORT", 3306)
+
+    if not host or not user or not dbname:
+        raise SystemExit("DB_HOST/DB_USER/DB_NAME not set in .env")
+
+    return pymysql.connect(host=host, user=user, password=password, database=dbname, port=port, autocommit=True)
+
+
+def get_expected_people(conn) -> int:
+    """
+    Expected = count of active works where work_status='work'
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM work WHERE work_status=%s", ("work",))
+        row = cur.fetchone()
+    return int(row[0] if row and row[0] is not None else 0)
+
+
+def load_cameras() -> List[Dict[str, Any]]:
+    cams_json = _env_str("CAMERAS_JSON", "[]").strip()
+    try:
+        cams = json.loads(cams_json)
+        if not isinstance(cams, list):
+            return []
+        return cams
+    except Exception:
+        return []
+
+
+def pick_office_camera(cams: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # предпочитаем id="office"
+    for c in cams:
+        if str(c.get("id", "")).strip().lower() == "office":
+            return c
+    # fallback: первая камера
+    if cams:
+        return cams[0]
+    raise SystemExit("No cameras in CAMERAS_JSON")
+
+
+def median_people_count(counter: PeopleCounterYOLO, rtsp_url: str, n: int = 5, sleep_s: float = 0.15) -> Tuple[int, Dict[str, Any], Optional[str]]:
+    """
+    Делает n снимков за короткое время, считает людей, возвращает median.
+    Также возвращает stats последнего кадра + путь к debug фото (если включено).
+    """
+    counts: List[int] = []
+    last_stats: Dict[str, Any] = {}
+    last_debug_boxes: Optional[str] = None
+
+    for i in range(n):
+        frame = rtsp_snapshot_bgr(rtsp_url)
+        res = counter.infer(frame)
+
+        cnt = int(res["count"])
+        counts.append(cnt)
+        last_stats = res.get("stats") or {}
+
+        # debug save on last frame to avoid spamming disk
+        if i == n - 1 and _env_bool("DEBUG_SAVE_PHOTOS", False):
+            ts = int(time.time())
+            out_prefix = f"/opt/factory-bot/photos/monitor_{ts}"
+            dets = res.get("detections") or []
+            paths = counter.draw_debug(frame, res.get("masked"), dets, out_prefix)
+            last_debug_boxes = paths.get("boxes")
+
+        time.sleep(max(0.0, sleep_s))
+
+    med = int(statistics.median(counts)) if counts else 0
+    last_stats["counts_window"] = counts
+    last_stats["median"] = med
+    return med, last_stats, last_debug_boxes
+
+
+def fmt_stats(stats: Dict[str, Any]) -> str:
+    # компактная строка для журнала
+    w, h = stats.get("frame_wh", ("?", "?"))
+    return (
+        f"frame={w}x{h} imgsz={stats.get('imgsz')} conf={stats.get('conf')} iou={stats.get('iou')} "
+        f"raw_after_conf={stats.get('raw_after_conf')} nms={stats.get('kept_after_nms')} kept={stats.get('kept_after_filters')} "
+        f"drop={stats.get('dropped')} min_h_px={stats.get('min_h_px')} min_area_px={stats.get('min_area_px')} "
+        f"win={stats.get('counts_window')} median={stats.get('median')} t_ms={stats.get('t_ms')}"
+    )
+
+
+def main():
+    model_path = _env_str("YOLO_MODEL_PATH", "models/yolov8n.onnx")
+    admin_chat_id = _env_str("ADMIN_CHAT_ID", _env_str("ADMIN_TELEGRAM_ID", ""))
+
+    if not admin_chat_id:
+        raise SystemExit("ADMIN_CHAT_ID / ADMIN_TELEGRAM_ID not set")
+
+    cams = load_cameras()
+    cam = pick_office_camera(cams)
+    rtsp_url = str(cam.get("rtsp_url", "")).strip()
+    room = str(cam.get("room", "Office")).strip()
+
+    if not rtsp_url:
+        raise SystemExit("office camera rtsp_url is empty")
+
+    interval_s = _env_int("MONITOR_INTERVAL_S", 10)
+    window_checks = _env_int("MONITOR_WINDOW_CHECKS", 6)
+
+    counter = PeopleCounterYOLO(model_path)
+    conn = db_connect()
+
+    bad_streak = 0
+    in_alarm = False
+    alarm_started_ts: Optional[float] = None
+    last_reported_diff: Optional[int] = None
+
+    tg_send_message(admin_chat_id, f"✅ factory-monitor started. room={room}. interval={interval_s}s window={window_checks}. YOLO imgsz={counter.imgsz}")
+
+    while True:
+        try:
+            expected = get_expected_people(conn)
+
+            detected, stats, debug_boxes_path = median_people_count(counter, rtsp_url, n=5, sleep_s=0.12)
+
+            # Лог в stdout (systemd journal)
+            print(f"[{datetime.now().isoformat(timespec='seconds')}] expected={expected} detected={detected} {fmt_stats(stats)}", flush=True)
+
+            if detected < expected:
+                bad_streak += 1
+            else:
+                bad_streak = 0
+
+            # ALARM state machine
+            if not in_alarm and bad_streak >= window_checks:
+                in_alarm = True
+                alarm_started_ts = time.time()
+                last_reported_diff = expected - detected
+
+                msg = (
+                    f"🚨 Тревога: людей меньше нормы\n"
+                    f"Комната: {room}\n"
+                    f"Ожидается: {expected}\n"
+                    f"На камере (median/5): {detected}\n"
+                    f"Diff: {expected - detected}\n"
+                    f"Stats: {fmt_stats(stats)}"
+                )
+                tg_send_message(admin_chat_id, msg)
+                if debug_boxes_path:
+                    tg_send_photo(admin_chat_id, debug_boxes_path, caption="Alarm snapshot (boxes)")
+
+            elif in_alarm:
+                diff = expected - detected
+                if diff > (last_reported_diff or 0):
+                    last_reported_diff = diff
+                    msg = (
+                        f"🚨 Ухудшилось: ушёл ещё человек\n"
+                        f"Комната: {room}\n"
+                        f"Ожидается: {expected}\n"
+                        f"На камере (median/5): {detected}\n"
+                        f"Diff: {diff}"
+                    )
+                    tg_send_message(admin_chat_id, msg)
+                    if debug_boxes_path:
+                        tg_send_photo(admin_chat_id, debug_boxes_path, caption="Worse snapshot (boxes)")
+
+                if detected >= expected:
+                    in_alarm = False
+                    bad_streak = 0
+                    dur_s = int(time.time() - (alarm_started_ts or time.time()))
+                    mm, ss = divmod(dur_s, 60)
+                    msg = f"✅ Ситуация восстановлена\nКомната: {room}\nОтсутствовали: {mm}м {ss}с"
+                    tg_send_message(admin_chat_id, msg)
+                    if debug_boxes_path:
+                        tg_send_photo(admin_chat_id, debug_boxes_path, caption="Recovered snapshot (boxes)")
+
+            time.sleep(max(1, interval_s))
+
+        except Exception as e:
+            # не падаем, но пишем в лог и ждём
+            print(f"[{datetime.now().isoformat(timespec='seconds')}] ERROR: {e}", flush=True)
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()

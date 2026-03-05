@@ -1,0 +1,161 @@
+import os
+import json
+import time
+from datetime import datetime
+from typing import List, Dict, Tuple
+
+import cv2
+import requests
+from dotenv import load_dotenv
+import pymysql
+
+from camera_people import PeopleCounter
+from rtsp_snapshot import grab_frame_ffmpeg
+
+
+def db_connect():
+    return pymysql.connect(
+        host=os.getenv("DB_HOST"),
+        port=int(os.getenv("DB_PORT", "3306")),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME", "factory"),
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=True,
+    )
+
+
+def fmt_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    m = seconds // 60
+    s = seconds % 60
+    return f"{m}мин {s}сек"
+
+
+def main():
+    load_dotenv()
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("ADMIN_TELEGRAM_ID")
+
+    interval = int(os.getenv("MONITOR_INTERVAL_SEC", "10"))
+    window_count = int(os.getenv("MONITOR_WINDOW_COUNT", "6"))
+
+    cam_id = os.getenv("OFFICE_CAMERA_ID", "office")
+    cameras = json.loads(os.getenv("CAMERAS_JSON"))
+
+    cam = next(c for c in cameras if c["id"] == cam_id)
+    rtsp_url = cam["rtsp_url"]
+
+    counter = PeopleCounter(
+        prototxt_path="models/MobileNetSSD_deploy.prototxt",
+        model_path="models/MobileNetSSD_deploy.caffemodel",
+        conf_thresh=float(os.getenv("DETECT_CONF", "0.45")),
+        nms_thresh=float(os.getenv("DETECT_NMS", "0.35")),
+    )
+
+    conn = db_connect()
+
+    alarm_active = False
+    alarm_started_ts = 0
+    bad_streak = 0
+    good_streak = 0
+
+    while True:
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # --- Получаем сотрудников "Работа в офисе"
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT u.fio
+                FROM work w
+                LEFT JOIN users u ON u.usid = w.usid
+                LEFT JOIN tasks t ON t.task_id = w.task_id
+                WHERE w.work_status=%s
+                  AND t.task_name=%s
+            """, (
+                os.getenv("ACTIVE_WORK_STATUS", "work"),
+                os.getenv("OFFICE_WORK_NAME", "Работа в офисе"),
+            ))
+            rows = cur.fetchall()
+
+        employees = [r["fio"] for r in rows if r.get("fio")]
+        expected = len(employees)
+
+        # --- Если задач нет
+        if expected <= 0:
+            if alarm_active:
+                duration = int(time.time()) - alarm_started_ts
+                msg = (
+                    "✅ Ситуация восстановлена\n"
+                    f"Отсутствовали: {fmt_duration(duration)}\n"
+                    "Причина: активных задач больше нет"
+                )
+                requests.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    data={"chat_id": chat_id, "text": msg},
+                    timeout=15,
+                )
+
+                alarm_active = False
+
+            print(f"[{ts_str}] expected=0 -> skip")
+            time.sleep(interval)
+            continue
+
+        # --- Детекция
+        frame = grab_frame_ffmpeg(rtsp_url)
+        detected = counter.count_people(frame)
+
+        if detected < expected:
+            bad_streak += 1
+            good_streak = 0
+        else:
+            good_streak += 1
+            bad_streak = 0
+
+        # --- Тревога
+        if not alarm_active and bad_streak >= window_count:
+            alarm_active = True
+            alarm_started_ts = int(time.time())
+
+            os.makedirs("photos", exist_ok=True)
+            photo_path = f"photos/alarm_{alarm_started_ts}.jpg"
+            cv2.imwrite(photo_path, frame)
+
+            caption = (
+                "🚨 ТРЕВОГА\n"
+                f"expected={expected}, detected={detected}\n\n"
+                "Активны:\n" + "\n".join(f"• {e}" for e in employees)
+            )
+
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendPhoto",
+                data={"chat_id": chat_id, "caption": caption},
+                files={"photo": open(photo_path, "rb")},
+                timeout=20,
+            )
+
+        # --- Восстановление (люди вернулись)
+        if alarm_active and good_streak >= window_count:
+            duration = int(time.time()) - alarm_started_ts
+
+            msg = (
+                "✅ Ситуация восстановлена\n"
+                f"Отсутствовали: {fmt_duration(duration)}"
+            )
+
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data={"chat_id": chat_id, "text": msg},
+                timeout=15,
+            )
+
+            alarm_active = False
+
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    main()

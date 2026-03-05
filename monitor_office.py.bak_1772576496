@@ -1,0 +1,199 @@
+import os
+import json
+import time
+from datetime import datetime
+from typing import List, Dict, Tuple
+
+import cv2
+import requests
+from dotenv import load_dotenv
+import pymysql
+
+from camera_people import PeopleCounter
+from rtsp_snapshot import grab_frame_ffmpeg
+
+
+def db_connect():
+    host = (os.getenv("DB_HOST") or "127.0.0.1").strip()
+    port = int(os.getenv("DB_PORT") or "3306")
+    db = (os.getenv("DB_NAME") or "factory").strip()
+    user = (os.getenv("DB_USER") or "").strip()
+    password = (os.getenv("DB_PASSWORD") or "").strip()
+    if not user:
+        raise SystemExit("DB_USER is not set")
+    return pymysql.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=db,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=True,
+    )
+
+
+def load_cameras_from_env() -> List[Dict]:
+    raw = (os.getenv("CAMERAS_JSON") or "").strip()
+    if not raw:
+        raise SystemExit("CAMERAS_JSON is not set")
+    return json.loads(raw)
+
+
+def select_camera(cameras: List[Dict], cam_id: str) -> Dict:
+    for c in cameras:
+        if c.get("id") == cam_id:
+            return c
+    raise SystemExit(f"Camera id not found in CAMERAS_JSON: {cam_id}")
+
+
+def tg_send_photo(token: str, chat_id: str, photo_path: str, caption: str) -> None:
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    with open(photo_path, "rb") as f:
+        r = requests.post(
+            url,
+            data={"chat_id": chat_id, "caption": caption},
+            files={"photo": f},
+            timeout=30,
+        )
+    r.raise_for_status()
+
+
+def query_office_active(conn) -> Tuple[int, List[str]]:
+    """
+    Под твою схему из bot.py:
+      work(w.usid, w.task_id, w.work_status)
+      users(u.usid, u.fio)
+      tasks(t.task_id, t.task_name)
+    """
+    office_work_name = (os.getenv("OFFICE_WORK_NAME") or "Работа в офисе").strip()
+    active_status = (os.getenv("ACTIVE_WORK_STATUS") or "work").strip()
+
+    sql = """
+    SELECT
+      u.fio
+    FROM work w
+    LEFT JOIN users u ON u.usid = w.usid
+    LEFT JOIN tasks t ON t.task_id = w.task_id
+    WHERE w.work_status = %s
+      AND t.task_name = %s
+    ORDER BY w.accept_dt DESC
+    """
+
+    with conn.cursor() as cur:
+        cur.execute(sql, (active_status, office_work_name))
+        rows = cur.fetchall()
+
+    employees = []
+    for r in rows:
+        fio = (r.get("fio") or "").strip()
+        if fio:
+            employees.append(fio)
+
+    return len(employees), employees
+
+
+def save_snapshot_jpg(img_bgr, out_path: str) -> None:
+    ok = cv2.imwrite(out_path, img_bgr)
+    if not ok:
+        raise RuntimeError("cv2.imwrite failed")
+
+
+def main():
+    load_dotenv()
+
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id = str(os.getenv("ADMIN_TELEGRAM_ID") or "").strip()
+    if not token:
+        raise SystemExit("TELEGRAM_BOT_TOKEN is not set")
+    if not chat_id:
+        raise SystemExit("ADMIN_TELEGRAM_ID is not set")
+
+    cam_id = (os.getenv("OFFICE_CAMERA_ID") or "office").strip()
+    cameras = load_cameras_from_env()
+    cam = select_camera(cameras, cam_id)
+    if not cam.get("enabled", True):
+        raise SystemExit(f"Camera {cam_id} is disabled in CAMERAS_JSON")
+    rtsp_url = (cam.get("rtsp_url") or "").strip()
+    if not rtsp_url:
+        raise SystemExit(f"Camera {cam_id} has no rtsp_url")
+
+    interval = int(os.getenv("MONITOR_INTERVAL_SEC") or "10")
+    window_count = int(os.getenv("MONITOR_WINDOW_COUNT") or "6")
+
+    conf = float(os.getenv("DETECT_CONF") or "0.45")
+    nms = float(os.getenv("DETECT_NMS") or "0.35")
+
+    counter = PeopleCounter(
+        prototxt_path="models/MobileNetSSD_deploy.prototxt",
+        model_path="models/MobileNetSSD_deploy.caffemodel",
+        conf_thresh=conf,
+        nms_thresh=nms,
+    )
+
+    conn = db_connect()
+
+    bad_streak = 0
+    last_alert_ts = 0
+    cooldown_sec = int(os.getenv("ALERT_COOLDOWN_SEC") or "300")  # 5 мин антиспам
+
+    print(f"[monitor] cam={cam_id} interval={interval}s window={window_count} conf={conf} nms={nms}")
+
+    while True:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        expected, employees = query_office_active(conn)
+
+        # если по БД в офисе никто не должен быть — не тревожим
+        if expected <= 0:
+            bad_streak = 0
+            print(f"[{ts}] expected=0 -> skip")
+            time.sleep(interval)
+            continue
+
+        try:
+            frame = grab_frame_ffmpeg(rtsp_url)
+            detected = counter.count_people(frame)
+        except Exception as e:
+            print(f"[{ts}] ERROR camera: {e}")
+            time.sleep(interval)
+            continue
+
+        if detected < expected:
+            bad_streak += 1
+            print(f"[{ts}] expected={expected} detected={detected} BAD ({bad_streak}/{window_count})")
+        else:
+            bad_streak = 0
+            print(f"[{ts}] expected={expected} detected={detected} OK")
+
+        now = int(time.time())
+        if bad_streak >= window_count and (now - last_alert_ts) >= cooldown_sec:
+            os.makedirs("photos", exist_ok=True)
+            photo_path = f"photos/alarm_{cam_id}_{now}.jpg"
+            save_snapshot_jpg(frame, photo_path)
+
+            caption_lines = [
+                "🚨 ТРЕВОГА: в офисе людей меньше, чем должно быть",
+                f"Камера: {cam.get('name', cam_id)} ({cam.get('room','')})",
+                f"expected={expected}, detected={detected}",
+                "",
+                f"Активно '{os.getenv('OFFICE_WORK_NAME','Работа в офисе')}' у сотрудников:",
+            ]
+            for name in employees:
+                caption_lines.append(f"• {name}")
+            caption = "\n".join(caption_lines)
+
+            try:
+                tg_send_photo(token, chat_id, photo_path, caption)
+                print(f"[{ts}] ALERT sent: {photo_path}")
+                last_alert_ts = now
+            except Exception as e:
+                print(f"[{ts}] ERROR telegram: {e}")
+
+            bad_streak = 0
+
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    main()

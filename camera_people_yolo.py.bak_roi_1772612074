@@ -1,0 +1,154 @@
+import cv2
+import numpy as np
+
+def _sigmoid(x):
+    # stable sigmoid for float32 arrays
+    x = np.clip(x, -50, 50)
+    return 1.0 / (1.0 + np.exp(-x))
+
+class PeopleCounterYOLO:
+    """
+    YOLOv8 ONNX (raw output) via OpenCV DNN (CPU-only).
+    Handles:
+      - (1,84,8400): [cx,cy,w,h] + 80 class logits/scores (no objectness)
+      - (1,85,8400): [cx,cy,w,h,obj] + 80 class logits/scores
+    Counts COCO person (class id 0).
+    """
+    def __init__(self, model_path: str, conf_thresh: float = 0.25, nms_thresh: float = 0.45, img_size: int = 640):
+        self.net = cv2.dnn.readNetFromONNX(model_path)
+        self.conf = float(conf_thresh)
+        self.nms = float(nms_thresh)
+        self.img_size = int(img_size)
+
+    @staticmethod
+    def _letterbox(img: np.ndarray, new_size: int = 640, color=(114,114,114)):
+        h, w = img.shape[:2]
+        r = min(new_size / h, new_size / w)
+        nh, nw = int(round(h * r)), int(round(w * r))
+        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+        pad_w = new_size - nw
+        pad_h = new_size - nh
+        left = pad_w // 2
+        top = pad_h // 2
+
+        out = cv2.copyMakeBorder(resized, top, pad_h - top, left, pad_w - left,
+                                 cv2.BORDER_CONSTANT, value=color)
+        return out, r, left, top
+
+    def count_people(self, img_bgr: np.ndarray) -> int:
+        H, W = img_bgr.shape[:2]
+
+        inp, r, left, top = self._letterbox(img_bgr, self.img_size)
+        blob = cv2.dnn.blobFromImage(inp, 1/255.0, (self.img_size, self.img_size), swapRB=True, crop=False)
+        self.net.setInput(blob)
+
+        out = self.net.forward()
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+
+        pred = out
+        if pred.ndim == 3:
+            pred = pred[0]  # (84,8400) or (85,8400)
+        if pred.shape[0] in (84, 85):
+            pred = pred.transpose(1, 0)  # -> (8400,84/85)
+
+        boxes = []
+        scores = []
+
+        PERSON = 0
+
+        # Heuristics for office camera:
+        # filter very small/huge boxes and weird aspect ratios
+        min_w = max(8, int(W * 0.02))
+        min_h = max(12, int(H * 0.03))
+        max_w = int(W * 0.95)
+        max_h = int(H * 0.95)
+        min_area = int(W * H * 0.005)  # 0.5% of frame
+
+        for row in pred:
+            d = row.shape[0]
+            if d not in (84, 85):
+                continue
+
+            cx, cy, bw, bh = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+
+            if d == 84:
+                cls = _sigmoid(row[4:])
+                score = float(cls[PERSON])
+            else:
+                obj = float(_sigmoid(row[4]))
+                cls = _sigmoid(row[5:])
+                score = obj * float(cls[PERSON])
+
+            if score < self.conf:
+                continue
+
+            # Many exports output coords in input (letterboxed) pixel space already.
+            # But some exports output normalized 0..1. Handle both:
+            if cx <= 1.5 and cy <= 1.5 and bw <= 1.5 and bh <= 1.5:
+                cx *= self.img_size
+                cy *= self.img_size
+                bw *= self.img_size
+                bh *= self.img_size
+
+            # xywh -> xyxy in letterbox coords
+            x1 = cx - bw/2.0
+            y1 = cy - bh/2.0
+            x2 = cx + bw/2.0
+            y2 = cy + bh/2.0
+
+            # unpad
+            x1 -= left; x2 -= left
+            y1 -= top;  y2 -= top
+
+            # unscale
+            x1 /= r; x2 /= r
+            y1 /= r; y2 /= r
+
+            # clip
+            x1 = max(0.0, min(W - 1.0, x1))
+            y1 = max(0.0, min(H - 1.0, y1))
+            x2 = max(0.0, min(W - 1.0, x2))
+            y2 = max(0.0, min(H - 1.0, y2))
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            ww = x2 - x1
+            hh = y2 - y1
+
+            # size filter
+            if ww < min_w or hh < min_h:
+                continue
+            if ww > max_w or hh > max_h:
+                continue
+
+            # area filter
+            if (ww * hh) < min_area:
+                continue
+
+            # aspect filter (allow seated people: height still usually >= width*0.9)
+            if hh < ww * 0.7:
+                continue
+
+            boxes.append([int(x1), int(y1), int(ww), int(hh)])
+            scores.append(score)
+
+        if not boxes:
+            return 0
+
+        # keep only top-K by score before NMS (reduces duplicates/noise)
+        TOPK = 150
+        if len(scores) > TOPK:
+            order = np.argsort(scores)[::-1][:TOPK]
+            boxes = [boxes[i] for i in order]
+            scores = [scores[i] for i in order]
+
+        idxs = cv2.dnn.NMSBoxes(boxes, scores, self.conf, self.nms)
+        if idxs is None or len(idxs) == 0:
+            return 0
+
+        # hard cap to avoid crazy counts if something goes wrong
+        return int(len(idxs))
+

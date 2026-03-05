@@ -1,0 +1,167 @@
+import cv2
+import numpy as np
+
+def _sigmoid(x):
+    x = np.clip(x, -50, 50)
+    return 1.0 / (1.0 + np.exp(-x))
+
+class PeopleCounterYOLO:
+    """
+    YOLOv8 ONNX raw output via OpenCV DNN (CPU-only).
+    Your model outputs (1,84,8400): 4 box + 80 class logits (no objectness).
+    We apply:
+      - sigmoid to class logits
+      - size/aspect/area filters (office heuristic)
+      - topK before NMS
+      - NMS
+      - ROI filter: count only boxes whose center falls in ROI (fractions 0..1)
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        conf_thresh: float = 0.45,
+        nms_thresh: float = 0.30,
+        img_size: int = 640,
+        roi_x1: float = 0.35,
+        roi_y1: float = 0.35,
+        roi_x2: float = 1.0,
+        roi_y2: float = 1.0,
+        topk: int = 150,
+    ):
+        self.net = cv2.dnn.readNetFromONNX(model_path)
+        self.conf = float(conf_thresh)
+        self.nms = float(nms_thresh)
+        self.img_size = int(img_size)
+        self.roi_x1 = float(roi_x1)
+        self.roi_y1 = float(roi_y1)
+        self.roi_x2 = float(roi_x2)
+        self.roi_y2 = float(roi_y2)
+        self.topk = int(topk)
+
+    @staticmethod
+    def _letterbox(img: np.ndarray, new_size: int = 640, color=(114,114,114)):
+        h, w = img.shape[:2]
+        r = min(new_size / h, new_size / w)
+        nh, nw = int(round(h * r)), int(round(w * r))
+        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        pad_w = new_size - nw
+        pad_h = new_size - nh
+        left = pad_w // 2
+        top = pad_h // 2
+        out = cv2.copyMakeBorder(resized, top, pad_h - top, left, pad_w - left,
+                                 cv2.BORDER_CONSTANT, value=color)
+        return out, r, left, top
+
+    def count_people(self, img_bgr: np.ndarray) -> int:
+        H, W = img_bgr.shape[:2]
+
+        inp, r, left, top = self._letterbox(img_bgr, self.img_size)
+        blob = cv2.dnn.blobFromImage(inp, 1/255.0, (self.img_size, self.img_size), swapRB=True, crop=False)
+        self.net.setInput(blob)
+
+        out = self.net.forward()
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+
+        pred = out
+        if pred.ndim == 3:
+            pred = pred[0]  # (84,8400)
+        # (84,8400) -> (8400,84)
+        if pred.shape[0] == 84:
+            pred = pred.transpose(1, 0)
+
+        PERSON = 0
+
+        boxes = []
+        scores = []
+
+        # Heuristics for office camera
+        min_w = max(10, int(W * 0.03))
+        min_h = max(14, int(H * 0.04))
+        max_w = int(W * 0.95)
+        max_h = int(H * 0.95)
+        min_area = int(W * H * 0.008)  # 0.8% of frame
+
+        for row in pred:
+            if row.shape[0] != 84:
+                continue
+
+            cx, cy, bw, bh = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+            cls = _sigmoid(row[4:])  # 80
+            score = float(cls[PERSON])
+            if score < self.conf:
+                continue
+
+            # Some exports output coords normalized 0..1. If so, scale to input size.
+            if cx <= 1.5 and cy <= 1.5 and bw <= 1.5 and bh <= 1.5:
+                cx *= self.img_size
+                cy *= self.img_size
+                bw *= self.img_size
+                bh *= self.img_size
+
+            # xywh -> xyxy in letterbox coords
+            x1 = cx - bw / 2.0
+            y1 = cy - bh / 2.0
+            x2 = cx + bw / 2.0
+            y2 = cy + bh / 2.0
+
+            # unpad
+            x1 -= left; x2 -= left
+            y1 -= top;  y2 -= top
+
+            # unscale
+            x1 /= r; x2 /= r
+            y1 /= r; y2 /= r
+
+            # clip
+            x1 = max(0.0, min(W - 1.0, x1))
+            y1 = max(0.0, min(H - 1.0, y1))
+            x2 = max(0.0, min(W - 1.0, x2))
+            y2 = max(0.0, min(H - 1.0, y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            ww = x2 - x1
+            hh = y2 - y1
+
+            if ww < min_w or hh < min_h:
+                continue
+            if ww > max_w or hh > max_h:
+                continue
+            if (ww * hh) < min_area:
+                continue
+            # seated people: allow more square-ish, but still not "very wide"
+            if hh < ww * 0.65:
+                continue
+
+            boxes.append([int(x1), int(y1), int(ww), int(hh)])
+            scores.append(score)
+
+        if not boxes:
+            return 0
+
+        # topK before NMS
+        if len(scores) > self.topk:
+            order = np.argsort(scores)[::-1][: self.topk]
+            boxes = [boxes[i] for i in order]
+            scores = [scores[i] for i in order]
+
+        idxs = cv2.dnn.NMSBoxes(boxes, scores, self.conf, self.nms)
+        if idxs is None or len(idxs) == 0:
+            return 0
+
+        # ROI filter on centers
+        rx1 = int(W * self.roi_x1)
+        ry1 = int(H * self.roi_y1)
+        rx2 = int(W * self.roi_x2)
+        ry2 = int(H * self.roi_y2)
+
+        cnt = 0
+        for ii in idxs.flatten():
+            x, y, ww, hh = boxes[int(ii)]
+            cx = x + ww / 2.0
+            cy = y + hh / 2.0
+            if (rx1 <= cx <= rx2) and (ry1 <= cy <= ry2):
+                cnt += 1
+        return int(cnt)

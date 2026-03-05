@@ -1,0 +1,100 @@
+import cv2
+import numpy as np
+
+class PeopleCounterYOLO:
+    """
+    YOLOv8n ONNX via OpenCV DNN (CPU-only).
+    Counts class=person (COCO class id 0).
+    """
+    def __init__(self, model_path: str, conf_thresh: float = 0.25, nms_thresh: float = 0.45, img_size: int = 640):
+        self.net = cv2.dnn.readNetFromONNX(model_path)
+        self.conf = float(conf_thresh)
+        self.nms = float(nms_thresh)
+        self.img_size = int(img_size)
+
+    @staticmethod
+    def _letterbox(img: np.ndarray, new_size: int = 640, color=(114, 114, 114)):
+        h, w = img.shape[:2]
+        r = min(new_size / h, new_size / w)
+        nh, nw = int(round(h * r)), int(round(w * r))
+        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+        pad_w = new_size - nw
+        pad_h = new_size - nh
+        left = pad_w // 2
+        top = pad_h // 2
+
+        out = cv2.copyMakeBorder(
+            resized,
+            top, pad_h - top,
+            left, pad_w - left,
+            cv2.BORDER_CONSTANT,
+            value=color,
+        )
+        return out, r, left, top
+
+    def count_people(self, img_bgr: np.ndarray) -> int:
+        H, W = img_bgr.shape[:2]
+
+        inp, r, left, top = self._letterbox(img_bgr, self.img_size)
+        blob = cv2.dnn.blobFromImage(inp, 1/255.0, (self.img_size, self.img_size), swapRB=True, crop=False)
+        self.net.setInput(blob)
+        out = self.net.forward()
+
+        pred = out
+        if pred.ndim == 3:
+            pred = pred[0]
+        # YOLOv8 exports can be (1,84,8400) or (1,8400,84)
+        if pred.shape[0] in (84, 85):  # (84,8400)
+            pred = pred.transpose(1, 0)  # -> (8400,84)
+
+        boxes = []
+        scores = []
+
+        for row in pred:
+            if row.shape[0] < 6:
+                continue
+            x, y, w, h = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+            obj = float(row[4])
+            cls_scores = row[5:]
+            if cls_scores.size == 0:
+                continue
+
+            cls_id = int(np.argmax(cls_scores))
+            if cls_id != 0:  # person
+                continue
+
+            conf = obj * float(cls_scores[cls_id])
+            if conf < self.conf:
+                continue
+
+            # xywh -> xyxy in letterbox space
+            x1 = x - w / 2.0
+            y1 = y - h / 2.0
+            x2 = x + w / 2.0
+            y2 = y + h / 2.0
+
+            # unpad
+            x1 -= left; x2 -= left
+            y1 -= top;  y2 -= top
+
+            # unscale
+            x1 /= r; x2 /= r
+            y1 /= r; y2 /= r
+
+            # clip
+            x1 = max(0.0, min(W - 1.0, x1))
+            y1 = max(0.0, min(H - 1.0, y1))
+            x2 = max(0.0, min(W - 1.0, x2))
+            y2 = max(0.0, min(H - 1.0, y2))
+
+            boxes.append([int(x1), int(y1), int(x2 - x1), int(y2 - y1)])  # xywh for NMSBoxes
+            scores.append(float(conf))
+
+        if not boxes:
+            return 0
+
+        idxs = cv2.dnn.NMSBoxes(boxes, scores, self.conf, self.nms)
+        if idxs is None or len(idxs) == 0:
+            return 0
+        return int(len(idxs))
