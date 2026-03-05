@@ -8,6 +8,11 @@ from typing import Any, Dict, List, Optional
 import pymysql
 
 from camera_people_yolo import PeopleCounterYOLO
+
+try:
+    from camera_people_ultra import PeopleCounterUltra
+except Exception:
+    PeopleCounterUltra = None
 from rtsp_snapshot import rtsp_snapshot_bgr
 from tg_notify import tg_send_message
 
@@ -105,7 +110,7 @@ def office_workers_count(conn) -> int:
     return int(value or 0)
 
 
-def office_camera_people_count(counter: PeopleCounterYOLO, rtsp_url: str) -> int:
+def office_camera_people_count(counter: Any, rtsp_url: str) -> int:
     retries = env_int("SNAPSHOT_RETRIES", 3)
     frames_per_measure = max(3, env_int("CAMERA_COUNT_FRAMES", 7))
     frame_delay_s = max(0.05, env_int("CAMERA_FRAME_DELAY_MS", 200) / 1000.0)
@@ -194,6 +199,7 @@ def main() -> None:
 
     interval_s = max(30, env_int("MONITOR_INTERVAL_S", 30))
     model_path = env_str("YOLO_MODEL_PATH", "models/yolov8n.onnx")
+    detector_engine = env_str("DETECTOR_ENGINE", "ultra").lower()
 
     cameras = load_cameras()
     office_camera = pick_office_camera(cameras)
@@ -201,7 +207,16 @@ def main() -> None:
     if not rtsp_url:
         raise SystemExit("Office camera rtsp_url is empty")
 
-    counter = PeopleCounterYOLO(model_path)
+    if detector_engine == "ultra":
+        if PeopleCounterUltra is None:
+            print("[WARN] DETECTOR_ENGINE=ultra but camera_people_ultra.py missing -> fallback to OpenCV YOLO", flush=True)
+            counter = PeopleCounterYOLO(model_path)
+        else:
+            counter = PeopleCounterUltra()
+            print("[INFO] People detector: Ultralytics YOLO (DETECTOR_ENGINE=ultra)", flush=True)
+    else:
+        counter = PeopleCounterYOLO(model_path)
+        print("[INFO] People detector: OpenCV ONNX YOLO (DETECTOR_ENGINE=opencv)", flush=True)
     stabilizer = CountStabilizer()
     conn = db_connect()
 
