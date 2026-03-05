@@ -125,17 +125,20 @@ def office_camera_people_count(counter: PeopleCounterYOLO, rtsp_url: str) -> int
                 return 0
 
             # 1) Убираем крайние выбросы (минимум/максимум), если выборка достаточная.
-            # 2) По оставшимся значениям берём моду (самое частое), при равенстве — медиану.
+            # 2) Берём устойчивую верхнюю оценку (P75), чтобы не занижать людей,
+            #    когда часть кадров временно даёт 0/1 из-за закрытий или позы.
+            # 3) Защита от случайного single-frame всплеска: итог не ниже моды.
             ordered = sorted(counts)
             core = ordered[1:-1] if len(ordered) >= 5 else ordered
             freq = Counter(core)
             max_freq = max(freq.values())
-            top = sorted([value for value, amount in freq.items() if amount == max_freq])
-            if len(top) == 1:
-                return int(top[0])
+            mode_candidates = sorted([value for value, amount in freq.items() if amount == max_freq])
+            mode_value = int(mode_candidates[-1])
 
-            median_idx = len(core) // 2
-            return int(sorted(core)[median_idx])
+            p75_index = int(round((len(core) - 1) * 0.75))
+            p75_value = int(core[p75_index])
+
+            return max(mode_value, p75_value)
         except Exception as exc:
             print(f"[{datetime.now().isoformat(timespec='seconds')}] camera read failed: {exc}", flush=True)
             time.sleep(1)
