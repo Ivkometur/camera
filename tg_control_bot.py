@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import re
 from typing import Any, Dict, Optional, Tuple
 
 import requests
@@ -13,6 +14,7 @@ OFFICE_STATUS_FLAG = os.path.join(STATE_DIR, "office_status_on")
 OFFSET_FILE = os.path.join(STATE_DIR, "tg_offset.json")
 
 LAST_TICK_FILE = os.path.join(STATE_DIR, "office_last_tick.json")     # written by monitor_office.py each tick
+LAST_TICK_FALLBACK_FILE = os.path.join(STATE_DIR, "office_last_tick.prev.json")
 BIAS_FILE = os.path.join(STATE_DIR, "office_bias.json")               # {"mean":float,"n":int,"updated_ts":int}
 CALIB_LOG = os.path.join(STATE_DIR, "office_calib.jsonl")             # append-only log
 
@@ -115,9 +117,12 @@ def _update_bias(new_bias: int) -> Tuple[float, int]:
 
 def _try_apply_calibration(real_count: int) -> Optional[str]:
     now = int(time.time())
-    tick = _read_json(LAST_TICK_FILE)
+    tick = _read_json(LAST_TICK_FILE) or _read_json(LAST_TICK_FALLBACK_FILE)
     if not tick:
-        return "Нет последнего замера (office_last_tick.json отсутствует). Сначала включи /o1 и дождись сообщения."
+        return (
+            "Нет последнего замера (office_last_tick.json отсутствует). "
+            f"Проверь, что monitor_office.py и tg_control_bot.py используют один STATE_DIR={STATE_DIR}."
+        )
     try:
         ts = int(tick.get("ts", 0))
         detected = int(tick.get("detected", 0))
@@ -195,10 +200,14 @@ def main() -> None:
                         _tg_send(ADMIN_CHAT_ID, f"ℹ️ mean_bias={mean:.2f} (n={n}), alpha={ALPHA}, ttl={TTL_SEC}s, max_abs={BIAS_MAX_ABS}")
                         continue
 
-                    # calibration: plain integer message
-                    # accept messages like "4" or "  4  "
-                    if text.isdigit():
-                        real = int(text)
+                    # calibration: numeric message
+                    # accept "4", " 4 ", "+4", "-1", "реально 4"
+                    m = re.search(r"[+-]?\d+", text)
+                    if m:
+                        real = int(m.group(0))
+                        if real < 0:
+                            _tg_send(ADMIN_CHAT_ID, "Калибровку не применил: число людей не может быть отрицательным.")
+                            continue
                         resp = _try_apply_calibration(real)
                         if resp:
                             _tg_send(ADMIN_CHAT_ID, resp)
