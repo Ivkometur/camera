@@ -1,5 +1,7 @@
 import os
 import logging
+import atexit
+import fcntl
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -28,6 +30,10 @@ DB_USER = (os.getenv("DB_USER") or "").strip()
 DB_PASSWORD = (os.getenv("DB_PASSWORD") or "").strip()
 
 ACTIVE_WORK_STATUS = (os.getenv("ACTIVE_WORK_STATUS") or "work").strip()
+STATE_DIR = (os.getenv("STATE_DIR") or "/opt/factory-bot/state").strip() or "/opt/factory-bot/state"
+LOCK_FILE = os.path.join(STATE_DIR, "bot.lock")
+
+_LOCK_FH = None
 
 if not BOT_TOKEN:
     raise SystemExit("TELEGRAM_BOT_TOKEN is not set")
@@ -41,6 +47,28 @@ def is_admin(update: Update) -> bool:
         return str(update.effective_chat.id) == str(ADMIN_CHAT_ID)
     except Exception:
         return False
+
+
+def acquire_single_instance_lock() -> None:
+    global _LOCK_FH
+    os.makedirs(STATE_DIR, exist_ok=True)
+    _LOCK_FH = open(LOCK_FILE, "w", encoding="utf-8")
+    try:
+        fcntl.flock(_LOCK_FH.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f"another instance is already running (lock: {LOCK_FILE})")
+    _LOCK_FH.write(str(os.getpid()))
+    _LOCK_FH.flush()
+
+    def _cleanup() -> None:
+        try:
+            if _LOCK_FH is not None:
+                fcntl.flock(_LOCK_FH.fileno(), fcntl.LOCK_UN)
+                _LOCK_FH.close()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup)
 
 def db_connect():
     return pymysql.connect(
@@ -128,6 +156,7 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ошибка: {e}")
 
 def main():
+    acquire_single_instance_lock()
     log.info("factory-bot started (polling)")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
