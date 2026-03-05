@@ -368,6 +368,9 @@ def main():
                 flush=True,
             )
 
+            # keep latest measurement for tg_control_bot calibration replies
+            _write_last_tick(int(time.time()), detected, expected, engine)
+
             ### [O1_STATUS_SEND] ###
             # /o1 enabled -> send short status each tick
             try:
