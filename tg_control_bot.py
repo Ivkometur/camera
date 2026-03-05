@@ -12,6 +12,11 @@ BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 ADMIN_CHAT_ID = str(os.getenv("ADMIN_CHAT_ID") or os.getenv("ADMIN_TELEGRAM_ID") or "").strip()
 
 STATE_DIR = (os.getenv("STATE_DIR") or "/opt/factory-bot/state").strip() or "/opt/factory-bot/state"
+EXTRA_STATE_DIRS = [
+    p.strip()
+    for p in (os.getenv("EXTRA_STATE_DIRS") or "").split(":")
+    if p.strip()
+]
 OFFICE_STATUS_FLAG = os.path.join(STATE_DIR, "office_status_on")
 OFFSET_FILE = os.path.join(STATE_DIR, "tg_offset.json")
 
@@ -27,6 +32,29 @@ BIAS_MAX_ABS = int(os.getenv("BIAS_MAX_ABS", "6"))
 TTL_SEC = int(os.getenv("CALIBRATION_TTL_SEC", "120"))
 
 _LOCK_FH = None
+
+
+def _candidate_state_dirs() -> list[str]:
+    dirs = [STATE_DIR, "/opt/factory-bot/state", os.path.join(os.getcwd(), "state")]
+    dirs.extend(EXTRA_STATE_DIRS)
+    out: list[str] = []
+    for d in dirs:
+        d = str(d or "").strip()
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
+def _candidate_last_tick_files() -> list[str]:
+    files = [LAST_TICK_FILE, LAST_TICK_FALLBACK_FILE]
+    for d in _candidate_state_dirs():
+        files.append(os.path.join(d, "office_last_tick.json"))
+        files.append(os.path.join(d, "office_last_tick.prev.json"))
+    out: list[str] = []
+    for p in files:
+        if p not in out:
+            out.append(p)
+    return out
 
 def _ensure_state_dir() -> None:
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -127,28 +155,49 @@ def _append_line(path: str, obj: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-def _load_bias() -> Tuple[float, int]:
-    d = _read_json(BIAS_FILE) or {}
+def _load_bias(path: Optional[str] = None) -> Tuple[float, int]:
+    d = _read_json(path or BIAS_FILE) or {}
     try:
         return float(d.get("mean", 0.0)), int(d.get("n", 0))
     except Exception:
         return 0.0, 0
 
-def _update_bias(new_bias: int) -> Tuple[float, int]:
-    mean, n = _load_bias()
+def _update_bias(new_bias: int, path: Optional[str] = None) -> Tuple[float, int]:
+    target = path or BIAS_FILE
+    mean, n = _load_bias(target)
     # EMA: mean = (1-alpha)*mean + alpha*new_bias
     mean2 = (1.0 - ALPHA) * float(mean) + ALPHA * float(new_bias)
     n2 = int(n) + 1
-    _write_json(BIAS_FILE, {"mean": mean2, "n": n2, "updated_ts": int(time.time())})
+    _write_json(target, {"mean": mean2, "n": n2, "updated_ts": int(time.time())})
     return mean2, n2
+
+
+def _latest_tick() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    best: Optional[Dict[str, Any]] = None
+    best_path: Optional[str] = None
+    best_ts = -1
+    for path in _candidate_last_tick_files():
+        payload = _read_json(path)
+        if not payload:
+            continue
+        try:
+            ts = int(payload.get("ts", 0))
+        except Exception:
+            continue
+        if ts >= best_ts:
+            best_ts = ts
+            best = payload
+            best_path = path
+    return best, best_path
 
 def _try_apply_calibration(real_count: int) -> Optional[str]:
     now = int(time.time())
-    tick = _read_json(LAST_TICK_FILE) or _read_json(LAST_TICK_FALLBACK_FILE)
+    tick, tick_path = _latest_tick()
     if not tick:
+        searched = ", ".join(_candidate_last_tick_files())
         return (
             "Нет последнего замера (office_last_tick.json отсутствует). "
-            f"Проверь, что monitor_office.py и tg_control_bot.py используют один STATE_DIR={STATE_DIR}."
+            f"Проверь, что monitor_office.py и tg_control_bot.py используют один STATE_DIR. Поиск: {searched}"
         )
     try:
         ts = int(tick.get("ts", 0))
@@ -165,9 +214,13 @@ def _try_apply_calibration(real_count: int) -> Optional[str]:
         _append_line(CALIB_LOG, {"ts": now, "real": real_count, "detected": detected, "expected": expected, "bias": bias, "accepted": False, "reason": "bias_too_large"})
         return f"Калибровку НЕ принял: разница {bias} слишком большая (лимит +/-{BIAS_MAX_ABS})."
 
-    mean2, n2 = _update_bias(bias)
+    bias_path = BIAS_FILE
+    if tick_path:
+        bias_path = os.path.join(os.path.dirname(tick_path), "office_bias.json")
+    mean2, n2 = _update_bias(bias, bias_path)
     _append_line(CALIB_LOG, {"ts": now, "real": real_count, "detected": detected, "expected": expected, "bias": bias, "accepted": True, "mean": mean2, "n": n2, "engine": engine})
-    return f"✅ Калибровка принята: детектор={detected}, реально={real_count}, bias={bias}. Текущий mean_bias={mean2:.2f} (n={n2})"
+    src = tick_path or LAST_TICK_FILE
+    return f"✅ Калибровка принята: детектор={detected}, реально={real_count}, bias={bias}. Текущий mean_bias={mean2:.2f} (n={n2}). Источник: {src}"
 
 def main() -> None:
     if not BOT_TOKEN:
