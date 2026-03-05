@@ -2,6 +2,8 @@ import os
 import time
 import json
 import re
+import atexit
+import fcntl
 from typing import Any, Dict, Optional, Tuple
 
 import requests
@@ -17,14 +19,39 @@ LAST_TICK_FILE = os.path.join(STATE_DIR, "office_last_tick.json")     # written 
 LAST_TICK_FALLBACK_FILE = os.path.join(STATE_DIR, "office_last_tick.prev.json")
 BIAS_FILE = os.path.join(STATE_DIR, "office_bias.json")               # {"mean":float,"n":int,"updated_ts":int}
 CALIB_LOG = os.path.join(STATE_DIR, "office_calib.jsonl")             # append-only log
+LOCK_FILE = os.path.join(STATE_DIR, "tg_control_bot.lock")
 
 POLL_SEC = float(os.getenv("TG_POLL_SEC", "1.0"))
 ALPHA = float(os.getenv("BIAS_ALPHA", "0.30"))
 BIAS_MAX_ABS = int(os.getenv("BIAS_MAX_ABS", "6"))
 TTL_SEC = int(os.getenv("CALIBRATION_TTL_SEC", "120"))
 
+_LOCK_FH = None
+
 def _ensure_state_dir() -> None:
     os.makedirs(STATE_DIR, exist_ok=True)
+
+
+def _acquire_single_instance_lock() -> None:
+    global _LOCK_FH
+    _ensure_state_dir()
+    _LOCK_FH = open(LOCK_FILE, "w", encoding="utf-8")
+    try:
+        fcntl.flock(_LOCK_FH.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f"another instance is already running (lock: {LOCK_FILE})")
+    _LOCK_FH.write(str(os.getpid()))
+    _LOCK_FH.flush()
+
+    def _cleanup() -> None:
+        try:
+            if _LOCK_FH is not None:
+                fcntl.flock(_LOCK_FH.fileno(), fcntl.LOCK_UN)
+                _LOCK_FH.close()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup)
 
 def _load_offset() -> int:
     try:
@@ -149,6 +176,7 @@ def main() -> None:
         raise SystemExit("ADMIN_CHAT_ID / ADMIN_TELEGRAM_ID is not set")
 
     _ensure_state_dir()
+    _acquire_single_instance_lock()
     offset = _load_offset()
 
     _tg_send(ADMIN_CHAT_ID, "🤖 TG control bot started.\nКоманды: /o1 (вкл статус), /o0 (выкл статус), /obias (показать bias)\nКалибровка: после сообщения 'В офисе - X людей' просто пришли правильное число (например 4).")

@@ -79,11 +79,23 @@ def _apply_bias(detected: int) -> int:
 def _write_last_tick(ts: int, detected: int, expected: int, engine: str) -> None:
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
+        prev_payload: Optional[Dict[str, Any]] = None
         if os.path.exists(OFFICE_LAST_TICK_FILE):
             try:
-                os.replace(OFFICE_LAST_TICK_FILE, OFFICE_LAST_TICK_PREV_FILE)
+                with open(OFFICE_LAST_TICK_FILE, "r", encoding="utf-8") as f_prev:
+                    prev_payload = json.load(f_prev) or {}
+            except Exception:
+                prev_payload = None
+
+        if prev_payload is not None:
+            try:
+                tmp_prev = OFFICE_LAST_TICK_PREV_FILE + ".tmp"
+                with open(tmp_prev, "w", encoding="utf-8") as f_prev_out:
+                    json.dump(prev_payload, f_prev_out, ensure_ascii=False)
+                os.replace(tmp_prev, OFFICE_LAST_TICK_PREV_FILE)
             except Exception:
                 pass
+
         tmp = OFFICE_LAST_TICK_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"ts": int(ts), "detected": int(detected), "expected": int(expected), "engine": str(engine)}, f, ensure_ascii=False)
@@ -422,8 +434,6 @@ def main():
             except Exception as _e:
                 print(f"[WARN] /o1 status send failed: {_e}", flush=True)
 ### [O1_STATUS_SEND] ###
-
-            _write_last_tick(int(time.time()), detected, expected, engine)
 
             raw_pair = (expected, detected)
 
