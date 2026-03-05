@@ -1,0 +1,7 @@
+numpy>=1.24
+opencv-python>=4.8
+python-dotenv>=1.0
+PyMySQL>=1.1
+requests>=2.31
+python-telegram-bot>=20.0,<21.0
+ultralytics>=8.2
